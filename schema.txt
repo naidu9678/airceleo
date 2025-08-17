@@ -1,0 +1,221 @@
+-- Enable UUIDs
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS citext;
+
+
+-- Enumerations
+CREATE TYPE user_type AS ENUM ('sender', 'traveler', 'admin', 'support');
+CREATE TYPE device_type AS ENUM ('web', 'ios', 'android', 'other');
+CREATE TYPE escrow_status AS ENUM ('pending', 'funded', 'in_escrow', 'released', 'refunded', 'cancelled');
+CREATE TYPE kyc_status AS ENUM ('pending', 'pass', 'fail', 'review');
+CREATE TYPE item_category AS ENUM ('documents', 'electronics', 'apparel', 'fragile', 'perishable', 'other');
+CREATE TYPE notify_pref AS ENUM ('all', 'important_only', 'none');
+
+-- USERS: stores only profile + hashed passwords (no plaintext)
+CREATE TABLE app_user (
+  user_id           UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  name              TEXT NOT NULL,
+  email             CITEXT UNIQUE,
+  phone_number      TEXT UNIQUE,
+  country           TEXT,
+  user_role         user_type NOT NULL,
+  password_hash     TEXT NOT NULL,                 -- no plaintext
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_app_user_email ON app_user (email);
+CREATE INDEX idx_app_user_phone ON app_user (phone_number);
+
+-- LOGIN ACTIVITY (audit)
+CREATE TABLE login_activity (
+  login_id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id           UUID NOT NULL REFERENCES app_user(user_id) ON DELETE CASCADE,
+  login_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  device            device_type,
+  ip_address        INET
+);
+CREATE INDEX idx_login_activity_user_time ON login_activity (user_id, login_at DESC);
+
+-- FLIGHT LISTINGS (by travelers)
+CREATE TABLE flight_listing (
+  flight_id         UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  traveler_id       UUID NOT NULL REFERENCES app_user(user_id) ON DELETE CASCADE,
+  airline_code      TEXT,
+  flight_number     TEXT NOT NULL,
+  depart_airport    TEXT NOT NULL,
+  arrive_airport    TEXT NOT NULL,
+  depart_time       TIMESTAMPTZ NOT NULL,
+  arrive_time       TIMESTAMPTZ,
+  baggage_space_kg  NUMERIC(8,2),                 -- available baggage space
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_flight_search ON flight_listing (depart_airport, arrive_airport, depart_time);
+
+-- DELIVERY REQUESTS (by senders)
+CREATE TABLE delivery_request (
+  request_id        UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  sender_id         UUID NOT NULL REFERENCES app_user(user_id) ON DELETE CASCADE,
+  pickup_city       TEXT NOT NULL,
+  delivery_city     TEXT NOT NULL,
+  category          item_category NOT NULL,
+  weight_kg         NUMERIC(8,2) NOT NULL,
+  earliest_pickup   TIMESTAMPTZ,
+  latest_delivery   TIMESTAMPTZ,
+  special_notes     TEXT,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_delivery_request_city ON delivery_request (pickup_city, delivery_city);
+CREATE INDEX idx_delivery_request_deadlines ON delivery_request (latest_delivery);
+
+-- MATCH BETWEEN DELIVERY REQUEST AND FLIGHT (agreement context)
+CREATE TABLE delivery_match (
+  match_id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  request_id        UUID NOT NULL REFERENCES delivery_request(request_id) ON DELETE CASCADE,
+  flight_id         UUID NOT NULL REFERENCES flight_listing(flight_id) ON DELETE CASCADE,
+  agreed_price      NUMERIC(12,2) NOT NULL,
+  currency          TEXT NOT NULL DEFAULT 'USD',
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (request_id, flight_id)
+);
+
+-- TRANSACTION / ESCROW LOGS (metadata only)
+CREATE TABLE transaction_log (
+  txn_id            UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  match_id          UUID NOT NULL REFERENCES delivery_match(match_id) ON DELETE CASCADE,
+  gateway_payment_id TEXT,                         -- external payment ID
+  method            TEXT,                          -- e.g., 'card', 'upi', 'wallet' (via API only)
+  amount            NUMERIC(12,2) NOT NULL,
+  currency          TEXT NOT NULL DEFAULT 'USD',
+  status            escrow_status NOT NULL,
+  status_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_transaction_match ON transaction_log (match_id);
+CREATE INDEX idx_transaction_status_time ON transaction_log (status, status_at DESC);
+
+-- CHAT (secured)
+CREATE TABLE chat_thread (
+  thread_id         UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  request_id        UUID REFERENCES delivery_request(request_id) ON DELETE SET NULL,
+  flight_id         UUID REFERENCES flight_listing(flight_id) ON DELETE SET NULL,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE chat_participant (
+  thread_id         UUID NOT NULL REFERENCES chat_thread(thread_id) ON DELETE CASCADE,
+  user_id           UUID NOT NULL REFERENCES app_user(user_id) ON DELETE CASCADE,
+  role              user_type,
+  PRIMARY KEY (thread_id, user_id)
+);
+
+CREATE TABLE chat_message (
+  message_id        UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  thread_id         UUID NOT NULL REFERENCES chat_thread(thread_id) ON DELETE CASCADE,
+  sender_id         UUID NOT NULL REFERENCES app_user(user_id) ON DELETE CASCADE,
+  sent_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+  content_encrypted TEXT NOT NULL                    -- secured content
+);
+CREATE INDEX idx_chat_thread_time ON chat_message (thread_id, sent_at);
+
+-- INSPECTION DATA (x-ray, video, gps+time logs)
+-- Store only references/locations to media; actual files live in secure object storage.
+CREATE TABLE inspection_record (
+  inspection_id     UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  match_id          UUID NOT NULL REFERENCES delivery_match(match_id) ON DELETE CASCADE,
+  xray_asset_url    TEXT,                            -- storage URL/key
+  video_asset_url   TEXT,
+  gps_track_geojson JSONB,                           -- optional path as GeoJSON
+  gps_recorded_at   TSRANGE,                         -- time range of GPS logs
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- TRAVELER DECLARATION (recorded consent videos)
+CREATE TABLE traveler_declaration (
+  declaration_id    UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  traveler_id       UUID NOT NULL REFERENCES app_user(user_id) ON DELETE CASCADE,
+  match_id          UUID NOT NULL REFERENCES delivery_match(match_id) ON DELETE CASCADE,
+  consent_video_url TEXT NOT NULL,
+  recorded_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (traveler_id, match_id)
+);
+
+-- DELIVERY HISTORY (deliveries with confirmations)
+CREATE TYPE delivery_status AS ENUM ('created', 'in_transit', 'delivered', 'cancelled');
+
+CREATE TABLE delivery_history (
+  history_id        UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  match_id          UUID NOT NULL REFERENCES delivery_match(match_id) ON DELETE CASCADE,
+  traveler_id       UUID NOT NULL REFERENCES app_user(user_id) ON DELETE CASCADE,
+  pickup_city       TEXT NOT NULL,
+  delivery_city     TEXT NOT NULL,
+  status            delivery_status NOT NULL,
+  confirmed_at      TIMESTAMPTZ,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_delivery_history_match ON delivery_history (match_id);
+CREATE INDEX idx_delivery_history_status ON delivery_history (status, created_at DESC);
+
+-- KYC VIA PERSONA (Docs are not stored by Airceleo; store only references and results)
+-- Do NOT store sensitive biometrics; only status and risk scores returned by Persona.
+CREATE TABLE kyc_session (
+  kyc_id            UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id           UUID NOT NULL REFERENCES app_user(user_id) ON DELETE CASCADE,
+  provider          TEXT NOT NULL DEFAULT 'Persona',
+  provider_session_id TEXT UNIQUE,                   -- session/token from Persona
+  status            kyc_status NOT NULL DEFAULT 'pending',
+  risk_score        NUMERIC(5,2),                    -- as provided by Persona
+  result_received_at TIMESTAMPTZ,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_kyc_user ON kyc_session (user_id, created_at DESC);
+
+-- LOCATION PERMISSION (real-time access on/off, city)
+CREATE TABLE location_permission (
+  permission_id     UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id           UUID NOT NULL REFERENCES app_user(user_id) ON DELETE CASCADE,
+  is_enabled        BOOLEAN NOT NULL DEFAULT FALSE,
+  city              TEXT,
+  updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (user_id)
+);
+
+-- PUSH PREFERENCES
+CREATE TABLE push_preference (
+  user_id           UUID PRIMARY KEY REFERENCES app_user(user_id) ON DELETE CASCADE,
+  opt_in            BOOLEAN NOT NULL DEFAULT TRUE,
+  preference        notify_pref NOT NULL DEFAULT 'all',
+  updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- AD ANALYTICS (views/clicks/impressions)
+CREATE TABLE ad_event (
+  event_id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id           UUID REFERENCES app_user(user_id) ON DELETE SET NULL,
+  event_type        TEXT NOT NULL,                   -- 'view', 'click', 'impression'
+  campaign_id       TEXT,
+  occurred_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  metadata          JSONB
+);
+CREATE INDEX idx_ad_event_type_time ON ad_event (event_type, occurred_at DESC);
+CREATE INDEX idx_ad_event_user_time ON ad_event (user_id, occurred_at DESC);
+
+-- PASSWORD POLICY AUDIT (only hashes elsewhere; optional additional audit)
+CREATE TABLE password_audit (
+  user_id           UUID PRIMARY KEY REFERENCES app_user(user_id) ON DELETE CASCADE,
+  hash_algorithm    TEXT NOT NULL,                   -- e.g., argon2id, bcrypt
+  last_rotated_at   TIMESTAMPTZ
+);
+
+-- GENERIC AUDIT LOG (optional)
+CREATE TABLE audit_log (
+  audit_id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id           UUID REFERENCES app_user(user_id) ON DELETE SET NULL,
+  entity_type       TEXT NOT NULL,
+  entity_id         UUID,
+  action            TEXT NOT NULL,                   -- create/update/delete/status_change
+  data_before       JSONB,
+  data_after        JSONB,
+  occurred_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_audit_entity ON audit_log (entity_type, entity_id, occurred_at DESC);
